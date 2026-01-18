@@ -84,7 +84,12 @@ class SimpleWarehouseEnv(gym.Env):
         """Execute one action"""
         self.step_count += 1
         self.last_action = int(action)
-        reward = -0.01  # Small penalty per step
+        reward = -0.02  # Penalty per step
+        done = False
+        
+        # Calculate distances BEFORE movement
+        old_dist_to_pickup = np.linalg.norm(self.agent_pos - self.pickup_pos)
+        old_dist_to_dest = np.linalg.norm(self.agent_pos - self.dest_pos)
         
         # Movement actions (0-3)
         if action == 0:  # up
@@ -100,35 +105,37 @@ class SimpleWarehouseEnv(gym.Env):
         elif action == 4:
             if np.linalg.norm(self.agent_pos - self.pickup_pos) < 0.5 and not self.holding_item:
                 self.holding_item = True
-                reward += 25
+                reward += 50  # Good reward for pickup
         
         # Drop action
         elif action == 5:
             if self.holding_item and np.linalg.norm(self.agent_pos - self.dest_pos) < 0.5:
-                self.holding_item = False
-                reward += 200  # Big reward for successful delivery
+                reward += 300  # BIG reward for success!
                 done = True
             elif self.holding_item:
-                self.holding_item = False
-                reward -= 5
-            else:
-                done = False
-                return self._get_observation(), reward, done, {}
+                reward -= 10  # Penalty for wrong drop
         
-        # Reward for moving towards pickup (if not holding)
+        # Reward shaping based on progress
         if not self.holding_item:
-            dist_to_pickup = np.linalg.norm(self.agent_pos - self.pickup_pos)
-            if dist_to_pickup < 2:
-                reward += 0.5
-        
-        # Reward for moving towards destination (if holding)
+            # Agent hasn't picked up yet - reward for moving towards pickup
+            new_dist_to_pickup = np.linalg.norm(self.agent_pos - self.pickup_pos)
+            if new_dist_to_pickup < old_dist_to_pickup:
+                reward += 2  # Strong reward for moving closer to pickup
+            elif new_dist_to_pickup < 1.5:
+                reward += 1  # Bonus when very close
         else:
-            dist_to_dest = np.linalg.norm(self.agent_pos - self.dest_pos)
-            if dist_to_dest < 2:
-                reward += 0.5
+            # Agent is holding item - reward for moving towards destination
+            new_dist_to_dest = np.linalg.norm(self.agent_pos - self.dest_pos)
+            if new_dist_to_dest < old_dist_to_dest:
+                reward += 2  # Strong reward for moving closer to destination
+            elif new_dist_to_dest < 1.5:
+                reward += 1  # Bonus when very close
         
         self.last_reward = reward
-        done = self.step_count > 100
+        
+        # Increased timeout - allow up to 200 steps for 5x5 grid
+        if self.step_count > 200:
+            done = True
         
         if self.render_mode == 'human':
             self.render()

@@ -22,11 +22,12 @@ try:
     model_path = "warehouse_delivery_agent.zip"
     
     if not os.path.exists(model_path):
-        print("Training new model (first time, ~60 seconds)...\n")
+        print("Training new model (first time, ~90 seconds)...\n")
         env = SimpleWarehouseEnv(grid_size=5, render_mode=None)
         model = PPO('MlpPolicy', env, verbose=0, learning_rate=0.001, 
-                   n_steps=512, batch_size=32, n_epochs=15, gamma=0.99)
-        model.learn(total_timesteps=100000)
+                   n_steps=1024, batch_size=64, n_epochs=20, gamma=0.99,
+                   ent_coef=0.01)
+        model.learn(total_timesteps=200000)
         model.save(model_path)
         env.close()
         print("✓ Model trained!\n")
