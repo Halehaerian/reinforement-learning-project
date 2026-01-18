@@ -1,14 +1,15 @@
 #!/usr/bin/env python
 """
-SIMPLE START - Just run this!
+Warehouse Delivery RL - Agent learns to pick up and deliver items
+Run: python start.py
 """
 
 import os
 import sys
 
-print("\n" + "="*80)
-print("WAREHOUSE RL - Quick Start".center(80))
-print("="*80 + "\n")
+print("\n" + "="*70)
+print("  Warehouse Delivery RL Agent".center(70))
+print("="*70 + "\n")
 
 try:
     import numpy as np
@@ -18,14 +19,14 @@ try:
     from simple_warehouse_env import SimpleWarehouseEnv
     
     # Check if model exists
-    model_path = "simple_warehouse_agent.zip"
+    model_path = "warehouse_delivery_agent.zip"
     
     if not os.path.exists(model_path):
-        print("Training new model (first time, ~45 seconds)...\n")
+        print("Training new model (first time, ~60 seconds)...\n")
         env = SimpleWarehouseEnv(grid_size=5, render_mode=None)
-        model = PPO('MlpPolicy', env, verbose=0, learning_rate=0.0005, 
-                   n_steps=512, batch_size=32, n_epochs=10, gamma=0.99)
-        model.learn(total_timesteps=50000)
+        model = PPO('MlpPolicy', env, verbose=0, learning_rate=0.001, 
+                   n_steps=512, batch_size=32, n_epochs=15, gamma=0.99)
+        model.learn(total_timesteps=100000)
         model.save(model_path)
         env.close()
         print("✓ Model trained!\n")
