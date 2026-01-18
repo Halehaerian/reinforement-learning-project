@@ -6,14 +6,16 @@ from enum import IntEnum
 
 
 class Actions(IntEnum):
-    TURN_LEFT = 0
-    TURN_RIGHT = 1
-    FORWARD = 2
-    PICKUP = 3
-    DROP = 4
+    MOVE_UP = 0
+    MOVE_DOWN = 1
+    MOVE_LEFT = 2
+    MOVE_RIGHT = 3
+    PICKUP = 4
+    DROP = 5
+    WAIT = 6
 
 
-class Direction(IntEnum):
+class Direction: # Keep for reference or remove if unused
     NORTH = 0
     EAST = 1
     SOUTH = 2
@@ -48,11 +50,13 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         self.cell_size = 70
         
         self.action_space = spaces.Discrete(len(Actions))
-        self.action_names = ["TURN L", "TURN R", "MOVE FWD", "PICK", "DROP"]
+        self.action_names = ["UP", "DOWN", "LEFT", "RIGHT", "PICK", "DROP"]
         
-        # Obs: [rel_x, rel_y, dir_sin, dir_cos, holding, wall_F, wall_L, wall_R, at_target, battery, rel_x_chg, rel_y_chg]
+        # Obs: [rel_target(x,y), holding, wall_U,D,L,R, at_target, batt, rel_chg(x,y), wall_count]
+        # Observation space: 16 features
+        # [rel_x, rel_y, holding, w_u, w_d, w_l, w_r, at_target, battery, chg_x, chg_y, wall_count, tw_u, tw_d, tw_l, tw_r]
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(12,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(16,), dtype=np.float32
         )
         
         # Map: 1 = Wall
@@ -70,6 +74,7 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         self.agent_dir = Direction.NORTH
         self.holding_item = False
         self.battery = 1.0
+        self.needs_charging = False
         
         # Ensure all positions are unique and not on walls
         self.charger_pos = self._get_free_pos()
@@ -90,6 +95,9 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         self.step_count = 0
         self.last_action = None
         self.last_reward = 0.0
+        self.last_pos = self.agent_pos.copy()
+        self.last_move_action = None
+        self.pos_history = [tuple(self.agent_pos)]
         return self._get_observation(), {}
 
     def _get_free_pos(self):
@@ -98,11 +106,13 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
             if self.map[int(pos[1]), int(pos[0])] == 0: return pos
 
     def _get_observation(self):
-        # Target logic: Charger overrides mission if battery < 20%
-        if self.battery < 0.2:
+        # Use existing target logic to ensure consistency
+        if self.battery < 0.25 or self.needs_charging:
             target = self.charger_pos
+        elif not self.holding_item:
+            target = self.pickup_pos
         else:
-            target = self.dest_pos if self.holding_item else self.pickup_pos
+            target = self.dest_pos
             
         rel_x = (target[0] - self.agent_pos[0]) / (self.grid_size - 1)
         rel_y = (target[1] - self.agent_pos[1]) / (self.grid_size - 1)
@@ -110,133 +120,164 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         rel_x_chg = (self.charger_pos[0] - self.agent_pos[0]) / (self.grid_size - 1)
         rel_y_chg = (self.charger_pos[1] - self.agent_pos[1]) / (self.grid_size - 1)
         
-        angle = self.agent_dir * (np.pi / 2)
+        # 4-Way Wall Radar: UP, DOWN, LEFT, RIGHT
+        w_u = float(self._check_wall_at(self.agent_pos[0], self.agent_pos[1] - 1))
+        w_d = float(self._check_wall_at(self.agent_pos[0], self.agent_pos[1] + 1))
+        w_l = float(self._check_wall_at(self.agent_pos[0] - 1, self.agent_pos[1]))
+        w_r = float(self._check_wall_at(self.agent_pos[0] + 1, self.agent_pos[1]))
         
-        # 3-Way Wall Radar: Front, Left, Right
-        w_f = float(self._check_wall(self.agent_dir))
-        w_l = float(self._check_wall((self.agent_dir - 1) % 4))
-        w_r = float(self._check_wall((self.agent_dir + 1) % 4))
+        # Stuck awareness: How many walls are around the agent?
+        wall_count = (w_u + w_d + w_l + w_r) / 4.0
         
         dist = np.linalg.norm(self.agent_pos - target)
-        at_target = 1.0 if dist < 0.9 else 0.0 
+        at_target = 1.0 if dist < 0.8 else 0.0 
+        
+        # Target's environment: Is the target near walls?
+        tw_u = float(self._check_wall_at(target[0], target[1] - 1))
+        tw_d = float(self._check_wall_at(target[0], target[1] + 1))
+        tw_l = float(self._check_wall_at(target[0] - 1, target[1]))
+        tw_r = float(self._check_wall_at(target[0] + 1, target[1]))
         
         return np.array([
             rel_x, rel_y, 
-            np.sin(angle), np.cos(angle), 
             float(self.holding_item),
-            w_f, w_l, w_r,
+            w_u, w_d, w_l, w_r,
             at_target,
             self.battery,
-            rel_x_chg, rel_y_chg
+            rel_x_chg, rel_y_chg,
+            wall_count,
+            tw_u, tw_d, tw_l, tw_r
         ], dtype=np.float32)
 
-    def _check_wall(self, look_dir):
-        """Helper: Checks for wall/boundary in a specific direction from current pos."""
-        new_pos = self.agent_pos.copy()
-        if look_dir == Direction.NORTH: new_pos[1] -= 1
-        elif look_dir == Direction.SOUTH: new_pos[1] += 1
-        elif look_dir == Direction.EAST:  new_pos[0] += 1
-        elif look_dir == Direction.WEST:  new_pos[0] -= 1
-        
-        if not (0 <= new_pos[0] < self.grid_size and 0 <= new_pos[1] < self.grid_size):
+    def _check_wall_at(self, x, y):
+        """Helper: Checks for wall/boundary at specific coordinated."""
+        if not (0 <= x < self.grid_size and 0 <= y < self.grid_size):
             return 1.0
-        return 1.0 if self.map[int(new_pos[1]), int(new_pos[0])] == 1 else 0.0
+        return 1.0 if self.map[int(y), int(x)] == 1 else 0.0
 
     def step(self, action):
         self.step_count += 1
         self.last_action = int(action)
         
         # --- BATTERY DRAIN ---
-        self.battery -= 0.005 # 200 steps total capacity
+        self.battery -= 0.02 # 2% each step
         if self.battery <= 0:
-            return self._get_observation(), -1000.0, True, False, {}
+            return self._get_observation(), -100.0, True, False, {} # Reduced death penalty
             
-        reward = -5.0  # Time penalty
+        reward = -1.0  # Standard time step penalty (encourage speed)
         done = False
         
-        # Determine Current Target based on Battery
-        if self.battery < 0.2:
+        # Determine Current Target
+        if self.battery < 0.25:
+            self.needs_charging = True
+            
+        if self.needs_charging:
             active_target = self.charger_pos
             target_type = "CHARGER"
+        elif not self.holding_item:
+            target_type = "PICKUP"
+            active_target = self.pickup_pos
         else:
-            active_target = self.dest_pos if self.holding_item else self.pickup_pos
-            target_type = "MISSION"
+            target_type = "DESTINATION"
+            active_target = self.dest_pos
+
+        self.target_type = target_type
+
+        # Reset history on target switch
+        if not hasattr(self, 'last_target_type') or self.last_target_type != target_type:
+            self.pos_history = []
+            self.last_target_type = target_type
             
-        self.dist_before = np.linalg.norm(self.agent_pos - active_target)
-        dist_before = self.dist_before
-        
-        # --- LURE REWARD ---
-        if dist_before < 0.9:
-            reward += 10.0
+        dist_before = np.linalg.norm(self.agent_pos - active_target)
         
         # 1. Action Execution
-        if action == Actions.TURN_LEFT or action == Actions.TURN_RIGHT:
-            if action == Actions.TURN_LEFT: self.agent_dir = (self.agent_dir - 1) % 4
-            else: self.agent_dir = (self.agent_dir + 1) % 4
+        if action < 4: # MOVE Actions
+            dx, dy = 0, 0
+            if action == Actions.MOVE_UP: dy = -1
+            elif action == Actions.MOVE_DOWN: dy = 1
+            elif action == Actions.MOVE_LEFT: dx = -1
+            elif action == Actions.MOVE_RIGHT: dx = 1
             
-        elif action == Actions.FORWARD:
-            new_pos = self.agent_pos.copy()
-            if self.agent_dir == Direction.NORTH: new_pos[1] -= 1
-            elif self.agent_dir == Direction.SOUTH: new_pos[1] += 1
-            elif self.agent_dir == Direction.EAST:  new_pos[0] += 1
-            elif self.agent_dir == Direction.WEST:  new_pos[0] -= 1
+            new_x = self.agent_pos[0] + dx
+            new_y = self.agent_pos[1] + dy
             
-            if (0 <= new_pos[0] < self.grid_size and 0 <= new_pos[1] < self.grid_size and 
-                self.map[int(new_pos[1]), int(new_pos[0])] == 0):
+            # Check for walls/borders
+            if (0 <= new_x < self.grid_size and 0 <= new_y < self.grid_size and 
+                self.map[int(new_y), int(new_x)] == 0):
                 
-                self.agent_pos = new_pos
+                self.agent_pos[0] = new_x
+                self.agent_pos[1] = new_y
                 dist_after = np.linalg.norm(self.agent_pos - active_target)
                 
-                # --- AUTO-TRIGGER Logic ---
-                if dist_after < 0.5: # Increased tolerance for reaching points next to walls
-                    if target_type == "CHARGER":
-                        self.battery = 1.0 # Full charge
-                        reward += 2000.0
-                        print(">>> STATUS: CHARGED! Mission Resumed.")
-                    elif not self.holding_item:
-                        self.holding_item = True
-                        reward += 5000.0
-                        print(">>> STATUS: AUTO-PICKUP!")
-                    else:
-                        self.holding_item = False
-                        reward += 10000.0
-                        done = True
-                        print(">>> STATUS: MISSION SUCCESS!")
+                # --- PROGRESS REWARD ---
+                # Positive if closer, Negative if further
+                progress = dist_before - dist_after
+                reward += progress * 10.0 
                 
-                if dist_after < dist_before:
-                    reward += 60.0
-                else:
-                    reward -= 2.0
+                # --- POSITION HISTORY (Anti-Loop) ---
+                curr_pos_tuple = (int(self.agent_pos[0]), int(self.agent_pos[1]))
+                if curr_pos_tuple in self.pos_history:
+                    # Penalize revisiting spots, but not paralyzed
+                    reward -= 5.0 
+                
+                self.pos_history.append(curr_pos_tuple)
+                if len(self.pos_history) > 8:
+                    self.pos_history.pop(0)
+
             else:
-                reward -= 100.0 # Wall crash penalty
+                # WALL COLLISION
+                reward -= 10.0 # Penalty for hitting wall (wasted step)
+                # No movement happened
             
+        elif action == Actions.WAIT:
+            # Only good if at charger and needs charging
+            dist_to_chg = np.linalg.norm(self.agent_pos - self.charger_pos)
+            if self.needs_charging and dist_to_chg < 1.0:
+                reward += 1.0 # Slight bonus for waiting at charger
+            else:
+                reward -= 5.0 # Penalty for waiting unnecessarily
+                
         elif action == Actions.PICKUP:
-            # Increased distance to 1.1 to allow pickup from adjacent cell if next to wall
-            if not self.holding_item and np.linalg.norm(self.agent_pos - self.pickup_pos) < 1.1:
+            if not self.holding_item and np.linalg.norm(self.agent_pos - self.pickup_pos) < 1.0:
                 self.holding_item = True
-                reward += 3000.0
+                reward += 50.0
                 print(">>> STATUS: PICKED UP!")
             else:
-                reward -= 50.0
+                reward -= 5.0 # Spammed pickup penalty
                 
         elif action == Actions.DROP:
-            # Increased distance to 1.1 to allow drop from adjacent cell if next to wall
-            if self.holding_item and np.linalg.norm(self.agent_pos - self.dest_pos) < 1.1:
+            if self.holding_item and np.linalg.norm(self.agent_pos - self.dest_pos) < 1.0:
                 self.holding_item = False
-                reward += 5000.0 
+                reward += 100.0 
                 done = True
                 print(">>> STATUS: MISSION COMPLETE!")
             else:
-                reward -= 50.0
+                reward -= 5.0
+
+        # --- AUTO-TRIGGER / PROXIMITY LOGIC ---
+        # Automatically trigger events if VERY close (convenience for RL)
+        dist_to_active = np.linalg.norm(self.agent_pos - active_target)
+        if dist_to_active < 0.5: 
+            reward += 10.0 # Bonus for reaching target
             
-        if self.step_count >= 250:
-            done = True
-        self.last_reward = reward
-        if self.render_mode == 'human': self.render(is_done=done)
-        return self._get_observation(), reward, done, False, {}
+            if target_type == "CHARGER":
+                self.battery = min(1.0, self.battery + 0.3) 
+                if self.battery >= 0.95 and self.needs_charging:
+                    self.needs_charging = False
+                    print(f">>> STATUS: CHARGED! Resuming Mission.")
+            elif target_type == "PICKUP" and not self.holding_item:
+                self.holding_item = True
+                reward += 50.0
+                print(">>> STATUS: AUTO-PICKUP!")
+            elif target_type == "DESTINATION" and self.holding_item:
+                self.holding_item = False
+                reward += 100.0
+                done = True
+                print(">>> STATUS: AUTO-DROP! SUCCESS!")
             
-        if self.step_count >= 150: # Shorter timeout to discourage slow agents
+        if self.step_count >= 200:
             done = True
+            
         self.last_reward = reward
         if self.render_mode == 'human': self.render(is_done=done)
         return self._get_observation(), reward, done, False, {}
@@ -271,12 +312,8 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         # Agent
         ax, ay = self._to_px(self.agent_pos)
         # Agent is RED while searching, YELLOW while holding
-        # If search agent is Red, we draw a darker red or keep it bright
         color = Colors.YELLOW if self.holding_item else (220, 0, 0)
         pygame.draw.circle(self.screen, color, (ax, ay), 25)
-        # Nose
-        nose_dir = [(0, -25), (25, 0), (0, 25), (-25, 0)][self.agent_dir]
-        pygame.draw.line(self.screen, Colors.BLACK, (ax, ay), (ax + nose_dir[0], ay + nose_dir[1]), 5)
 
         # Info Panel
         px_off = self.grid_size * self.cell_size + 20
@@ -288,11 +325,21 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         self.screen.blit(self.font.render(f"Battery: {self.battery*100:.0f}%", True, batt_color), (px_off, 70))
         
         # STATUS TEXT
-        status_text = "PICKED UP!" if self.holding_item else "SEARCHING..."
-        if self.battery < 0.2: status_text = "LOW BATTERY! (Go to CHG)"
+        batt_low = self.battery < 0.2
+        is_looping = tuple(self.agent_pos) in self.pos_history[:-1] if hasattr(self, 'pos_history') else False
         
-        status_color = Colors.YELLOW if self.holding_item else Colors.BLUE
-        if self.battery < 0.2: status_color = Colors.RED
+        if batt_low:
+            status_text = "LOW BATTERY! (Go to CHG)"
+            status_color = Colors.RED
+        elif is_looping:
+            status_text = "LOOP DETECTED!"
+            status_color = (255, 140, 0) # Orange
+        elif not self.holding_item:
+            status_text = "GO TO PICKUP"
+            status_color = Colors.BLUE
+        else:
+            status_text = "GO TO DESTINATION"
+            status_color = Colors.YELLOW
             
         self.screen.blit(self.font.render(f"STATUS:", True, Colors.BLACK), (px_off, 110))
         self.screen.blit(self.font.render(status_text, True, status_color), (px_off, 135))
@@ -315,7 +362,9 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
             self.screen.blit(txt, ((self.grid_size * self.cell_size)//2 - txt.get_width()//2, 
                                   (self.grid_size * self.cell_size)//2 - 10))
             
-            self.screen.blit(self.font.render("MISSION END", True, (255, 255, 255)), (px_off, 200))
+            # Draw MISSION END separately, below the main banner
+            end_color = Colors.GREEN if success else Colors.RED
+            self.screen.blit(self.font.render("MISSION END", True, end_color), (px_off, 230))
             
         pygame.display.flip()
         self.clock.tick(15)

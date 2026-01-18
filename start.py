@@ -48,9 +48,9 @@ class RLManager:
             gamma=0.99,
             train_freq=4,
             gradient_steps=1,
-            target_update_interval=2000,
-            exploration_fraction=0.8, # Explore 80% of the time
-            exploration_final_eps=0.02 # Reach almost pure exploitation at end
+            target_update_interval=1000,
+            exploration_fraction=0.3, # Faster transition to exploitation
+            exploration_final_eps=0.01 # Near pure exploitation
         )
         
         start_time = time.time()
