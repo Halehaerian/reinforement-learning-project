@@ -30,6 +30,7 @@ class Colors:
     GREEN = (50, 200, 50)    # (Unused or Success)
     RED = (255, 50, 50)      # Destination Point (Agent is also Red/Yellow)
     YELLOW = (255, 220, 0)   # Carrying State
+    PURPLE = (160, 32, 240)  # Charger Point
 
 
 class AdvancedRobotWarehouseEnv(gymnasium.Env):
@@ -49,9 +50,9 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         self.action_space = spaces.Discrete(len(Actions))
         self.action_names = ["TURN L", "TURN R", "MOVE FWD", "PICK", "DROP"]
         
-        # Obs: [rel_x, rel_y, dir_sin, dir_cos, holding, wall_F, wall_L, wall_R, at_target]
+        # Obs: [rel_x, rel_y, dir_sin, dir_cos, holding, wall_F, wall_L, wall_R, at_target, battery, rel_x_chg, rel_y_chg]
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(9,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(12,), dtype=np.float32
         )
         
         # Map: 1 = Wall
@@ -68,11 +69,22 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         self.agent_pos = self._get_free_pos()
         self.agent_dir = Direction.NORTH
         self.holding_item = False
+        self.battery = 1.0
+        
+        # Ensure all positions are unique and not on walls
+        self.charger_pos = self._get_free_pos()
+        while np.array_equal(self.charger_pos, self.agent_pos):
+            self.charger_pos = self._get_free_pos()
+
         self.pickup_pos = self._get_free_pos()
-        while np.array_equal(self.pickup_pos, self.agent_pos):
+        while (np.array_equal(self.pickup_pos, self.agent_pos) or 
+               np.array_equal(self.pickup_pos, self.charger_pos)):
             self.pickup_pos = self._get_free_pos()
+            
         self.dest_pos = self._get_free_pos()
-        while np.array_equal(self.dest_pos, self.pickup_pos) or np.array_equal(self.dest_pos, self.agent_pos):
+        while (np.array_equal(self.dest_pos, self.pickup_pos) or 
+               np.array_equal(self.dest_pos, self.agent_pos) or 
+               np.array_equal(self.dest_pos, self.charger_pos)):
             self.dest_pos = self._get_free_pos()
             
         self.step_count = 0
@@ -86,9 +98,18 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
             if self.map[int(pos[1]), int(pos[0])] == 0: return pos
 
     def _get_observation(self):
-        target = self.dest_pos if self.holding_item else self.pickup_pos
+        # Target logic: Charger overrides mission if battery < 20%
+        if self.battery < 0.2:
+            target = self.charger_pos
+        else:
+            target = self.dest_pos if self.holding_item else self.pickup_pos
+            
         rel_x = (target[0] - self.agent_pos[0]) / (self.grid_size - 1)
         rel_y = (target[1] - self.agent_pos[1]) / (self.grid_size - 1)
+        
+        rel_x_chg = (self.charger_pos[0] - self.agent_pos[0]) / (self.grid_size - 1)
+        rel_y_chg = (self.charger_pos[1] - self.agent_pos[1]) / (self.grid_size - 1)
+        
         angle = self.agent_dir * (np.pi / 2)
         
         # 3-Way Wall Radar: Front, Left, Right
@@ -104,7 +125,9 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
             np.sin(angle), np.cos(angle), 
             float(self.holding_item),
             w_f, w_l, w_r,
-            at_target
+            at_target,
+            self.battery,
+            rel_x_chg, rel_y_chg
         ], dtype=np.float32)
 
     def _check_wall(self, look_dir):
@@ -123,17 +146,28 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         self.step_count += 1
         self.last_action = int(action)
         
-        # --- URGENCY: HIGH STEP PENALTY ---
-        reward = -5.0  # Every single step costs money to force speed
+        # --- BATTERY DRAIN ---
+        self.battery -= 0.005 # 200 steps total capacity
+        if self.battery <= 0:
+            return self._get_observation(), -1000.0, True, False, {}
+            
+        reward = -5.0  # Time penalty
         done = False
         
-        active_target = self.dest_pos if self.holding_item else self.pickup_pos
+        # Determine Current Target based on Battery
+        if self.battery < 0.2:
+            active_target = self.charger_pos
+            target_type = "CHARGER"
+        else:
+            active_target = self.dest_pos if self.holding_item else self.pickup_pos
+            target_type = "MISSION"
+            
         self.dist_before = np.linalg.norm(self.agent_pos - active_target)
         dist_before = self.dist_before
         
-        # --- LURE REWARD: Encourage staying on the target cell to learn interaction ---
+        # --- LURE REWARD ---
         if dist_before < 0.9:
-            reward += 10.0 # Cancels step penalty and gives small bonus for reaching target
+            reward += 10.0
         
         # 1. Action Execution
         if action == Actions.TURN_LEFT or action == Actions.TURN_RIGHT:
@@ -154,41 +188,52 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
                 dist_after = np.linalg.norm(self.agent_pos - active_target)
                 
                 # --- AUTO-TRIGGER Logic ---
-                # Check if we landed on the active target cell (center)
-                if dist_after < 0.2:
-                    if not self.holding_item:
+                if dist_after < 0.5: # Increased tolerance for reaching points next to walls
+                    if target_type == "CHARGER":
+                        self.battery = 1.0 # Full charge
+                        reward += 2000.0
+                        print(">>> STATUS: CHARGED! Mission Resumed.")
+                    elif not self.holding_item:
                         self.holding_item = True
                         reward += 5000.0
-                        print(">>> AUTO-PICKUP! (Heading to Destination...)")
+                        print(">>> STATUS: AUTO-PICKUP!")
                     else:
-                        self.holding_item = False # Drop the parcel
+                        self.holding_item = False
                         reward += 10000.0
                         done = True
-                        print(">>> MISSION SUCCESS! (Dropped at Destination)")
+                        print(">>> STATUS: MISSION SUCCESS!")
                 
                 if dist_after < dist_before:
-                    reward += 60.0 # Increased reward for progress
+                    reward += 60.0
                 else:
-                    reward -= 2.0  # LOWER penalty for moving away (allows maneuvering around walls)
+                    reward -= 2.0
             else:
-                reward -= 100.0 # HEAVIER penalty for wall crash
+                reward -= 100.0 # Wall crash penalty
             
         elif action == Actions.PICKUP:
-            if not self.holding_item and dist_before < 0.9:
+            # Increased distance to 1.1 to allow pickup from adjacent cell if next to wall
+            if not self.holding_item and np.linalg.norm(self.agent_pos - self.pickup_pos) < 1.1:
                 self.holding_item = True
-                reward += 3000.0 # Increased reward for clarity
-                print(">>> STATUS: PICKED UP! (Robot Color -> Yellow)")
+                reward += 3000.0
+                print(">>> STATUS: PICKED UP!")
             else:
-                reward -= 100.0 # Penalty for misuse
+                reward -= 50.0
                 
         elif action == Actions.DROP:
-            if self.holding_item and dist_before < 0.9:
-                self.holding_item = False # Color returns to Red instantly
+            # Increased distance to 1.1 to allow drop from adjacent cell if next to wall
+            if self.holding_item and np.linalg.norm(self.agent_pos - self.dest_pos) < 1.1:
+                self.holding_item = False
                 reward += 5000.0 
                 done = True
-                print(f">>> STATUS: MISSION COMPLETE! (Total Steps: {self.step_count})")
+                print(">>> STATUS: MISSION COMPLETE!")
             else:
-                reward -= 100.0
+                reward -= 50.0
+            
+        if self.step_count >= 250:
+            done = True
+        self.last_reward = reward
+        if self.render_mode == 'human': self.render(is_done=done)
+        return self._get_observation(), reward, done, False, {}
             
         if self.step_count >= 150: # Shorter timeout to discourage slow agents
             done = True
@@ -217,6 +262,11 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         # DESTINATION is RED as requested
         pygame.draw.circle(self.screen, Colors.RED, (dx, dy), 15)
         self.screen.blit(self.font.render("DEST", True, Colors.WHITE), (dx-16, dy-6))
+        
+        # Charger
+        cx, cy = self._to_px(self.charger_pos)
+        pygame.draw.rect(self.screen, Colors.PURPLE, (cx-15, cy-15, 30, 30))
+        self.screen.blit(self.font.render("CHG", True, Colors.WHITE), (cx-16, cy-6))
 
         # Agent
         ax, ay = self._to_px(self.agent_pos)
@@ -232,19 +282,23 @@ class AdvancedRobotWarehouseEnv(gymnasium.Env):
         px_off = self.grid_size * self.cell_size + 20
         self.screen.blit(self.font.render(f"Step: {self.step_count}", True, Colors.BLACK), (px_off, 40))
         
+        # Battery display
+        batt_color = Colors.GREEN if self.battery > 0.4 else (255, 100, 0)
+        if self.battery < 0.2: batt_color = Colors.RED
+        self.screen.blit(self.font.render(f"Battery: {self.battery*100:.0f}%", True, batt_color), (px_off, 70))
+        
         # STATUS TEXT
         status_text = "PICKED UP!" if self.holding_item else "SEARCHING..."
-        if is_done and not self.holding_item and self.dist_before < 1.1: 
-            status_text = "DROPPED SUCCESSFULLY!"
+        if self.battery < 0.2: status_text = "LOW BATTERY! (Go to CHG)"
         
         status_color = Colors.YELLOW if self.holding_item else Colors.BLUE
-        if is_done and not self.holding_item: status_color = Colors.GREEN
+        if self.battery < 0.2: status_color = Colors.RED
             
-        self.screen.blit(self.font.render(f"STATUS:", True, Colors.BLACK), (px_off, 70))
-        self.screen.blit(self.font.render(status_text, True, status_color), (px_off, 95))
+        self.screen.blit(self.font.render(f"STATUS:", True, Colors.BLACK), (px_off, 110))
+        self.screen.blit(self.font.render(status_text, True, status_color), (px_off, 135))
         
-        self.screen.blit(self.font.render(f"Action: {self.action_names[self.last_action] if self.last_action is not None else 'IDLE'}", True, Colors.BLACK), (px_off, 130))
-        self.screen.blit(self.font.render(f"Reward: {self.last_reward:+.1f}", True, Colors.BLACK), (px_off, 160))
+        self.screen.blit(self.font.render(f"Action: {self.action_names[self.last_action] if self.last_action is not None else 'IDLE'}", True, Colors.BLACK), (px_off, 170))
+        self.screen.blit(self.font.render(f"Reward: {self.last_reward:+.1f}", True, Colors.BLACK), (px_off, 200))
         
         if is_done:
             # MISSION COMPLETE BANNER
