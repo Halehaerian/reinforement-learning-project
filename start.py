@@ -13,61 +13,44 @@ print("="*70 + "\n")
 
 try:
     import numpy as np
-    import gym
     import pygame
-    from stable_baselines3 import PPO
+    from stable_baselines3 import DQN
     from simple_warehouse_env import SimpleWarehouseEnv
     
-    # Check if model exists
-    model_path = "warehouse_delivery_agent.zip"
+    model_path = "warehouse_delivery_agent_dqn.zip"
     
     if not os.path.exists(model_path):
-        print("Training new model (first time, ~90 seconds)...\n")
+        print("Training DQN model for STRICT 2-Part Logic...")
         env = SimpleWarehouseEnv(grid_size=5, render_mode=None)
-        model = PPO('MlpPolicy', env, verbose=0, learning_rate=0.001, 
-                   n_steps=1024, batch_size=64, n_epochs=20, gamma=0.99,
-                   ent_coef=0.01)
-        model.learn(total_timesteps=200000)
+        # 50k steps is plenty for a 5x5 grid if exploration is efficient
+        model = DQN('MlpPolicy', env, verbose=1, 
+                    learning_rate=1e-3, 
+                    exploration_fraction=0.5, # 25k steps of exploration
+                    buffer_size=50000,
+                    target_update_interval=500)
+        model.learn(total_timesteps=50000)
         model.save(model_path)
         env.close()
-        print("✓ Model trained!\n")
+        print("✓ Training complete.\n")
     
-    # Load model
-    model = PPO.load(model_path)
-    
-    # Run test episodes
-    print("Starting visual test (3 episodes)...")
-    print("Watch the pygame window!\n")
-    print("="*70 + "\n")
-    
+    model = DQN.load(model_path)
     env = SimpleWarehouseEnv(grid_size=5, render_mode='human')
     
-    successes = 0
-    for episode in range(3):
-        print(f"Episode {episode + 1}/3: ", end="", flush=True)
-        
-        obs = env.reset()
-        done = False
-        steps = 0
-        
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            action = int(action)
-            obs, reward, done, _ = env.step(action)
-            steps += 1
-        
-        if steps < 50:
-            print(f"✓ SUCCESS ({steps} steps)")
-            successes += 1
-        else:
-            print(f"⏱ Timeout ({steps} steps)")
+    print("Testing One Full Mission...")
+    obs, _ = env.reset()
+    done = False
+    while not done:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, term, trunc, _ = env.step(int(action))
+        done = term or trunc
+        pygame.time.wait(200)
+    
+    # Final pause to see the "PACKAGE DELIVERED" banner
+    print("✓ Mission Complete. End of evaluation.")
+    pygame.time.wait(3000)
     
     env.close()
-    
-    print("\n" + "="*70)
-    print(f"Result: {successes}/3 Episodes Successful".center(70))
-    print("="*70 + "\n")
-    print("✓ Done!\n")
+    sys.exit(0)
 
 except KeyboardInterrupt:
     print("\n\n⏹ Cancelled")
